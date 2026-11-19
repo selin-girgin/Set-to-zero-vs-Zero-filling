@@ -1,0 +1,292 @@
+---
+title: "A simulation study comparing set-to-zero and zero-filling approaches"
+author: "Raanan Raz, Selin Girgin"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(ggthemes)
+library(survival)
+library(dlnm)
+library(patchwork)
+
+mytheme <- theme(strip.text = element_text(size = 9, face= "bold", margin = margin(0.05,0.05,0.05,0.05, "cm")),
+        strip.background = element_rect(fill="#E3B8AF"),
+        axis.text = element_text(size = 9),
+        panel.grid.minor = element_blank())
+```
+
+### Auxiliary functions:
+
+For modeling
+
+```{r}
+# To build the crossbasis object
+build_crossbasis <- function(df) {
+  # Extract exposure matrix
+  expmat_tmean <- df %>%
+    select(Tmeanw1:Tmeanw37)
+
+  # Build crossbasis
+  cb <- crossbasis(
+    expmat_tmean,
+    lag = 36,
+    argvar = list(fun = "ns", knots=c(15,24)), #specify the placement of the knots
+    arglag = list(fun = "ns", df = 3)
+  )
+}
+
+# To calculate hazard ratios
+calc_HRs <- function(df, cb, formula = NULL, cen = 16, at = 9:31) {
+  model1 <- coxph(formula, data = df)
+  crosspred1 <- crosspred(cb, model1, cen = cen, at = at)
+  tmp <- data.frame(crosspred1$matRRfit) %>% 
+    pivot_longer(names(data.frame(crosspred1$matRRfit)), names_to = "lag", values_to = "HR")
+  tmp$HR
+}
+```
+
+For plotting
+
+```{r}
+# To plot weekly associations
+weekly_HR_plot_sim <- function(HRs_list, title = NULL, min_y = 0.9, max_y = 1.1) {
+  mat <- do.call(rbind, HRs_list)
+  df <-  data.frame(Ta = rep(9:31, each = 37), 
+                    ga_week = factor(rep(1:37, 23)))
+  df$HR_mean <- colMeans(mat)
+  df$HR_se <- apply(mat, 2, sd)
+
+  df %>% 
+    filter(ga_week %in% c(2:37)) %>% 
+    ggplot(aes(x=Ta,y=HR_mean)) +
+    geom_vline(xintercept = 16, linewidth=0.2, linetype = 2, alpha = 0.5) + 
+    geom_hline(yintercept = 1, linewidth=0.2, linetype = 2, alpha = 0.5) +
+    geom_ribbon(aes(ymin=(HR_mean - HR_se), ymax=(HR_mean + HR_se)), alpha=0.2, 
+                fill= "#7A2412") +
+    geom_line(color="#7A2412") +
+    scale_y_log10(breaks = c(min_y,1,max_y)) +
+    coord_cartesian(ylim = c(min_y, max_y)) +
+    facet_wrap(~ga_week) +
+    labs(x = "Temperature (°C)", 
+         y = "Hazard Ratio (SE)",
+         title = title) +
+    theme_bw() +
+    mytheme
+}
+
+# To plot both methods combined 
+plot_all <- function(HR_lists, filename = "Output/weekly.png", 
+                     min_y = 0.9, max_y = 1.1) {
+
+# Plot weekly associations:
+  plot_set_to_zero <- weekly_HR_plot_sim(HR_lists$HRs_list_set_to_zero, title = "A. Set-to-zero", min_y = min_y, max_y = max_y)
+  
+  plot_filling_zero <- weekly_HR_plot_sim(HR_lists$HRs_list_filling_zero, title = "B. Zero-filling", min_y = min_y, max_y = max_y)
+
+  
+# Both methods:   
+  plot_all_weekly <- plot_set_to_zero + plot_filling_zero
+  
+  ggsave(filename = filename, plot_all_weekly, width = 30, height = 20, 
+         units = "cm", device = 'png')
+}
+```
+
+### Simulation basic function
+
+```{r}
+
+simulate_survival_empirical_hazard <- function(baseline_hazard_vec,
+                                               start_day_vector,
+                                               causal_amplitude = 0,
+                                               temp37,
+                                               temp36,
+                                               temp35,
+                                               temp34,
+                                               temp33) {
+  
+  n <- length(start_day_vector)
+  cohort <- data.frame(id = 1:n, start_day = start_day_vector)
+
+  # Simulating a causal effect of temperature:
+  causal_modifier <- function(temperature) {
+    theta <-  temperature / (31*7)
+    exp(causal_amplitude * theta)
+  }
+
+  # Simulate time to birth with temparature modulated hazard
+  
+# h_final is calculated by the hazard function h(t|d,temp) for birth at gestational age t (in days) at calendar day d (ranging between 1 and 365), and temp_n the average temperature during the nth week of gestation (n in 33 to 37) in degrees Celsius based on scenarios of differing causal effect of temperature.
+# Start_day: last menstrual period (LMP) day (ranging between 1 and 365)
+  
+  simulate_one <- function(start_day, temp33, temp34, temp35, temp36, temp37) {
+    for (t in 1:max_day) {
+      h_base <- baseline_hazard_vec[t]
+      if (t >= 36*7) {
+      h_final <- h_base * causal_modifier(temp33) * causal_modifier(temp34) * causal_modifier(temp35) * causal_modifier(temp36) * causal_modifier(temp37)
+    } else if (t >= 35*7) {
+      h_final <- h_base * causal_modifier(temp33) * causal_modifier(temp34) * causal_modifier(temp35) * causal_modifier(temp36)
+    } else if (t >= 34*7) {
+      h_final <- h_base * causal_modifier(temp33) * causal_modifier(temp34) * causal_modifier(temp35)
+    } else if (t >= 33*7) {
+      h_final <- h_base * causal_modifier(temp33) * causal_modifier(temp34)
+    } else if (t >= 32*7) {
+      h_final <- h_base * causal_modifier(temp33)
+    }
+      else {
+      h_final <- h_base
+    } # If a randomly drawn uniform value is below the hazard of birth at gestational day t (h_final), birth is assumed to occur on that day. Otherwise, the simulation continues to the next follow-up day.
+      if (runif(1) < h_final) return(t)
+    }
+    return(max_day)
+  }
+
+  cohort$time_to_birth_days <- mapply(simulate_one, 
+                                    start_day = cohort$start_day, 
+                                    temp33, temp34, temp35, temp36, temp37)
+
+  cohort$gest_age_weeks <- cohort$time_to_birth_days / 7
+
+  return(cohort)
+}
+
+```
+
+### Simulation loop function
+
+```{r}
+
+simulate_n_iterations <- function(n_sim = 1, 
+                                  sample_size = 13160, 
+                                  causal_amplitude = 0) {
+  
+  set.seed(123)
+  HRs_list_set_to_zero <- list()
+  HRs_list_filling_zero <- list()
+  
+  for (i in 1:n_sim) {
+    
+# Randomly select n births from the original birth cohort
+    df <- sample_n(births, size = sample_size, replace = FALSE) 
+  
+# Simulate the cohort 
+    sim_cohort <- simulate_survival_empirical_hazard(
+      baseline_hazard_vec = baseline_hazard_vec,
+      start_day_vector = yday(df$LMP),
+      causal_amplitude = causal_amplitude,
+      temp37 = df$Tmeanw37,
+      temp36 = df$Tmeanw36,
+      temp35 = df$Tmeanw35,
+      temp34 = df$Tmeanw34,
+      temp33 = df$Tmeanw33
+    )
+
+# Use the simulated gestational age at birth (in weeks)
+    df$gest_age_week <- sim_cohort$gest_age_weeks
+
+##### Zero-filling method
+    df1 <- df
+       
+# Fill the post-birth exposures with zero  
+    for (j in 1:37) {
+      df1[[paste0("Tmeanw", j)]][j > df1$gest_age_week +1] <- 0
+    }
+
+# Create time and event variables
+    df1$time <- as.integer(df1$gest_age_week) + 1
+    df1$event <- as.numeric(df1$gest_age_week < 37)
+    df1$time[df1$time > 37] <- 37
+       
+# Build the cross-basis for the DLNM
+    cb1 <- build_crossbasis(df1)     
+
+
+##### Set-to-zero method    
+        
+# Prepare the long data set for the Cox model with time-dependent covariates  
+    df2 <- df[rep(rownames(df), as.integer(df$gest_age_week) +1),]
+
+# Setting start (T1) and stop (T2) points for each follow-up step  
+    df2 <- df2 %>%
+      mutate(T2 = rowid(BirthID),
+             T1 = T2 - 1)
+
+# Event is 1: if birth happened in that follow-up week; 0: otherwise
+    df2$event <- ifelse(df2$T1 == as.integer(df2$gest_age_week), 1, 0)
+    
+# Removing the follow-up weeks where there is no risk of preterm birth
+    df2 <- df2 %>% filter(T1 > 22 & T1 < 37)
+    
+# Set the exposures to zero in the exposure weeks after each follow-up week  
+    for (j in 1:37) {
+      df2[[paste0("Tmeanw", j)]][df2$T2 < j] <- 0
+    }
+    
+# Build the cross-basis for the DLNM
+    cb2 <- build_crossbasis(df2)
+    
+  
+##### Calculating hazard ratios for each method:   
+    
+    HRs_list_filling_zero[[i]] <- calc_HRs(df1, cb1, Surv(time, event) ~ cb1 + cluster(MomID))
+    
+    HRs_list_set_to_zero[[i]] <- calc_HRs(df2, cb2, Surv(T1, T2, event) ~ cb2 + cluster(MomID))
+    
+  }
+  
+    HR_lists <- tibble(HRs_list_set_to_zero, HRs_list_filling_zero)
+}
+
+```
+
+### Preparation for the simulation
+
+```{r}
+# Load the real birth cohort data
+births <- readRDS("birth_cohort.rds")
+
+# Gestational age at birth (in days)
+births$real_gest_age_days <- round(births$gest_age_week * 7)
+max_day <- max(births$real_gest_age_days)
+
+# Birth counts by gestational day
+births_per_day <- tabulate(births$real_gest_age_days, nbins = max_day)
+
+# Reverse cumulative sum (N still pregnant before each day)
+still_pregnant <- rev(cumsum(rev(births_per_day)))
+
+# True hazard: births on day t / still pregnant at start of day t
+baseline_hazard_vec <- births_per_day / still_pregnant
+```
+
+### Running the simulations
+
+```{r}
+
+n_sim <- 500 # number of iteration
+sample_size <- 131600/10 # 10% of the cohort population
+
+date()
+
+# Scenario 1: No effect of temperature
+HR_lists <- simulate_n_iterations(n_sim, sample_size, 
+                                  causal_amplitude = 0)
+saveRDS(HR_lists, "causal 0 iter 500 sample 13K.rds")
+
+date()
+```
+
+### Plotting
+
+```{r}
+# Scenario 1: No effect of temperature
+plot_all(readRDS("causal 0 iter 500 sample 13K.rds"), 
+         filename = "causal 0 iter 500 sample 13K.png",
+         min_y = 0.75, max_y = 1.25)
+```
